@@ -4,9 +4,12 @@
  */
 
 const BLOCKED_METADATA_HOSTS = new Set([
-  '169.254.169.254',  // AWS/GCP/Azure instance metadata
+  '169.254.169.254',  // AWS/GCP/Azure instance metadata (IPv4 link-local)
+  'fe80::1',          // IPv6 link-local — common metadata endpoint alias
   'fd00::',           // IPv6 unique local (metadata in some cloud setups)
+  '::ffff:169.254.169.254', // IPv4-mapped IPv6 form of the metadata IP
   'metadata.google.internal', // GCP metadata
+  'metadata.azure.internal',  // Azure IMDS
 ]);
 
 /**
@@ -43,7 +46,45 @@ function isMetadataIp(hostname: string): boolean {
   return false;
 }
 
-export function validateNavigationUrl(url: string): void {
+/**
+ * Resolve a hostname to its IP addresses and check if any resolve to blocked metadata IPs.
+ * Mitigates DNS rebinding: even if the hostname looks safe, the resolved IP might not be.
+ *
+ * Checks both A (IPv4) and AAAA (IPv6) records — an attacker can use AAAA-only DNS to
+ * bypass IPv4-only checks. Each record family is tried independently; failure of one
+ * (e.g. no AAAA records exist) is not treated as a rebinding risk.
+ */
+async function resolvesToBlockedIp(hostname: string): Promise<boolean> {
+  try {
+    const dns = await import('node:dns');
+    const { resolve4, resolve6 } = dns.promises;
+
+    // Check IPv4 A records
+    const v4Check = resolve4(hostname).then(
+      (addresses) => addresses.some(addr => BLOCKED_METADATA_HOSTS.has(addr)),
+      () => false, // ENODATA / ENOTFOUND — no A records, not a risk
+    );
+
+    // Check IPv6 AAAA records — the gap that issue #668 identified
+    const v6Check = resolve6(hostname).then(
+      (addresses) => addresses.some(addr => {
+        const normalized = addr.toLowerCase();
+        return BLOCKED_METADATA_HOSTS.has(normalized) ||
+          // fe80::/10 is link-local — always block (covers all fe80:: addresses)
+          normalized.startsWith('fe80:');
+      }),
+      () => false, // ENODATA / ENOTFOUND — no AAAA records, not a risk
+    );
+
+    const [v4Blocked, v6Blocked] = await Promise.all([v4Check, v6Check]);
+    return v4Blocked || v6Blocked;
+  } catch {
+    // Unexpected error — fail open (don't block navigation on DNS infrastructure failure)
+    return false;
+  }
+}
+
+export async function validateNavigationUrl(url: string): Promise<void> {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -62,6 +103,17 @@ export function validateNavigationUrl(url: string): void {
   if (BLOCKED_METADATA_HOSTS.has(hostname) || isMetadataIp(hostname)) {
     throw new Error(
       `Blocked: ${parsed.hostname} is a cloud metadata endpoint. Access is denied for security.`
+    );
+  }
+
+  // DNS rebinding protection: resolve hostname and check if it points to metadata IPs.
+  // Skip for loopback/private IPs — they can't be DNS-rebinded and the async DNS
+  // resolution adds latency that breaks concurrent E2E tests under load.
+  const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+  const isPrivateNet = /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/.test(hostname);
+  if (!isLoopback && !isPrivateNet && await resolvesToBlockedIp(hostname)) {
+    throw new Error(
+      `Blocked: ${parsed.hostname} resolves to a cloud metadata IP. Possible DNS rebinding attack.`
     );
   }
 }
